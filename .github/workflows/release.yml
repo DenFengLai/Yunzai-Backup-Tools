@@ -1,0 +1,80 @@
+name: Release
+
+permissions:
+  contents: write # 上传 release 资产需要这个权限 :contentReference[oaicite:2]{index=2}
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.*"
+  workflow_dispatch: {}
+
+env:
+  BIN_NAME: yunzai_backup
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create GitHub Release
+        uses: taiki-e/create-gh-release-action@v1
+        with:
+          # 可选：如果你有 CHANGELOG.md 就打开这一行
+          # changelog: CHANGELOG.md
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  build-and-upload:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+
+          # Windows
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+          # macOS Intel
+          - os: macos-latest
+            target: x86_64-apple-darwin
+
+          # macOS Apple Silicon
+          - os: macos-latest
+            target: aarch64-apple-darwin
+
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }} # rustup 额外安装目标 :contentReference[oaicite:4]{index=4}
+
+      # (可选但推荐) Rust 构建缓存
+      - uses: Swatinem/rust-cache@v2
+
+      # musl 目标在 ubuntu 需要 musl-gcc 等工具
+      - name: Install musl tools
+        if: startsWith(matrix.os, 'ubuntu') && contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build & Upload assets to Release
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: ${{ env.BIN_NAME }}
+          target: ${{ matrix.target }}
+          # 资产文件名：xxx-v0.1.0-x86_64-unknown-linux-gnu.tar.gz / .zip 等
+          archive: $bin-$tag-$target
+          token: ${{ secrets.GITHUB_TOKEN }}
