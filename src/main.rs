@@ -1,28 +1,40 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use flate2::write::GzEncoder;
 use flate2::Compression;
+use flate2::write::GzEncoder;
 use git2::Repository;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::exit;
 use tar::Builder;
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
 /// 简单的备份/还原工具
 ///
-/// 功能（尽量遵从你要求的流程）：
-/// - backup: 将当前目录下的 dump.rdb、config/、data/ 以及 plugins/**/(config|data) 打包到一个 tar.gz
+/// 功能：
+/// - backup: 将工作目录下的 dump.rdb、config/、data/ 以及 plugins/**/(config|data) 打包到一个 tar.gz
 ///   - 同时扫描 plugins 下是否有 git 仓库，记录每个仓库的 remote URL 和 分支（以及 commit）到 metadata.json
-/// - restore: 从指定的 tar.gz 解包，先按 metadata.json 中的信息把 plugins 的仓库 clone 回正确位置并切换到记录的分支，
-///   然后把 config/data/dump.rdb 覆盖回当前目录
+/// - restore: 从指定的 tar.gz 解包，按 metadata.json 的信息 clone 仓库并恢复文件
 #[derive(Parser)]
-#[command(author, version, about)]
+#[command(
+    author,
+    version,
+    about,
+    long_about = "示例:\n  your_program backup\n  your_program -w /path backup -o mybackup.tar.gz --example-js-only\n  your_program restore -i mybackup.tar.gz"
+)]
 struct Cli {
+    /// 指定工作目录（默认当前运行目录）
+    #[arg(short = 'w', long, global = true, value_name = "PATH")]
+    workdir: Option<PathBuf>,
+
+    /// 隐藏的 workdir 短选项 -C（行为等同 -w，但不会出现在 help 中）
+    #[arg(short = 'C', global = true, hide = true, value_name = "PATH")]
+    workdir_hidden: Option<PathBuf>,
+
     #[command(subcommand)]
     cmd: Commands,
 }
@@ -30,12 +42,19 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// 备份到一个 tar.gz 文件
+    #[command(alias = "b")]
     Backup {
-        /// 输出文件，例如 backup.tar.gz
-        #[arg(short, long)]
+        /// 输出文件，例如 backup.tar.gz（默认 backup.tar.gz）
+        #[arg(short, long, default_value = "backup.tar.gz")]
         out: PathBuf,
+
+        /// 仅备份 plugins/example 下的 .js/.js.bak 与 package.json（跳过 node_modules）
+        #[arg(short = 'j', long)]
+        example_js_only: bool,
     },
+
     /// 从备份文件还原
+    #[command(alias = "r")]
     Restore {
         /// 输入的备份文件
         #[arg(short, long)]
@@ -60,69 +79,118 @@ struct MetaData {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // 处理工作目录优先级：visible -w > hidden -C > current_dir
+    let cwd = if let Some(wd) = cli.workdir {
+        wd
+    } else if let Some(wd2) = cli.workdir_hidden {
+        wd2
+    } else {
+        std::env::current_dir()?
+    };
+
     match cli.cmd {
-        Commands::Backup { out } => backup(out).context("backup failed")?,
-        Commands::Restore { input } => restore(input).context("restore failed")?,
+        Commands::Backup {
+            out,
+            example_js_only,
+        } => backup(&cwd, out, example_js_only).context("backup failed")?,
+        Commands::Restore { input } => restore(&cwd, input).context("restore failed")?,
     }
     Ok(())
 }
 
-fn backup(out: PathBuf) -> Result<()> {
-    let cwd = std::env::current_dir()?;
+fn backup(cwd: &Path, out: PathBuf, example_js_only: bool) -> Result<()> {
     println!("工作目录: {}", cwd.display());
 
+    // 先扫描并收集要加入归档的文件路径（绝对或相对于 cwd 的 PathBuf），同时收集 repos_info
     let mut repos_info: Vec<GitRepoInfo> = Vec::new();
+    let mut files_to_add: Vec<PathBuf> = Vec::new();
+    let mut rel_seen: HashSet<String> = HashSet::new(); // 防重复，存相对路径字符串
 
-    // 先创建一个 tar builder 写入到 gzip
-    let tar_gz = fs::File::create(&out).with_context(|| format!("无法创建输出文件 {}", out.display()))?;
-    let enc = GzEncoder::new(tar_gz, Compression::default());
-    let mut tar = Builder::new(enc);
+    // helper: 把单个文件加入集合（以 cwd 相对路径去重）
+    fn push_file(
+        p: &Path,
+        files_to_add: &mut Vec<PathBuf>,
+        rel_seen: &mut HashSet<String>,
+        cwd: &Path,
+    ) -> Result<()> {
+        if p.exists() && p.is_file() {
+            let rel = p.strip_prefix(cwd)?.to_string_lossy().replace('\\', "/");
+            if !rel_seen.contains(&rel) {
+                rel_seen.insert(rel);
+                files_to_add.push(p.to_path_buf());
+            }
+        }
+        Ok(())
+    }
 
-    // helper: 尝试把某个路径（文件或目录）添加到 tar
-    fn add_path(tar: &mut Builder<GzEncoder<fs::File>>, cwd: &Path, p: &Path) -> Result<()> {
-        if p.exists() {
-            if p.is_file() {
-                tar.append_path_with_name(p, p.strip_prefix(cwd)?.to_path_buf())?;
-            } else if p.is_dir() {
-                // walkdir 把目录下所有文件加进去
-                for entry in WalkDir::new(p) {
-                    let entry = entry?;
-                    let path = entry.path();
-                    if path.is_file() {
-                        let name = path.strip_prefix(cwd)?;
-                        tar.append_path_with_name(path, name)?;
-                    }
+    // helper: 收集目录下所有文件（不跳过 node_modules）
+    fn collect_dir_all(
+        dir: &Path,
+        files_to_add: &mut Vec<PathBuf>,
+        rel_seen: &mut HashSet<String>,
+        cwd: &Path,
+    ) -> Result<()> {
+        if dir.exists() && dir.is_dir() {
+            for e in WalkDir::new(dir) {
+                let e = e?;
+                let p = e.path();
+                if p.is_file() {
+                    push_file(p, files_to_add, rel_seen, cwd)?;
                 }
             }
         }
         Ok(())
     }
-    
+
+    // helper: 收集目录下所有文件但跳过 node_modules（用于 plugins/example）
+    fn collect_dir_skip_node_modules(
+        dir: &Path,
+        files_to_add: &mut Vec<PathBuf>,
+        rel_seen: &mut HashSet<String>,
+        cwd: &Path,
+    ) -> Result<()> {
+        if dir.exists() && dir.is_dir() {
+            for e in WalkDir::new(dir) {
+                let e = e?;
+                let p = e.path();
+                let skip = p
+                    .components()
+                    .any(|c| c.as_os_str() == OsStr::new("node_modules"));
+                if skip {
+                    continue;
+                }
+                if p.is_file() {
+                    push_file(p, files_to_add, rel_seen, cwd)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     // 1) dump.rdb
     let dump = cwd.join("dump.rdb");
-    add_path(&mut tar, &cwd, &dump)?;
-    
-    // 2) ./config 和 ./data
-    add_path(&mut tar, &cwd, &cwd.join("config"))?;
-    add_path(&mut tar, &cwd, &cwd.join("data"))?;
+    push_file(&dump, &mut files_to_add, &mut rel_seen, cwd)?;
 
-    // 3) plugins/**/(config|data) 和扫描 git 仓库，并且额外处理 plugins/example 的 .js/.js.bak 与 package.json
+    // 2) ./config 和 ./data（完整收集）
+    collect_dir_all(&cwd.join("config"), &mut files_to_add, &mut rel_seen, cwd)?;
+    collect_dir_all(&cwd.join("data"), &mut files_to_add, &mut rel_seen, cwd)?;
+
+    // 3) plugins/**/(config|data) 和扫描 git 仓库，并且处理 plugins/example 的策略
     let plugins_dir = cwd.join("plugins");
     if plugins_dir.exists() && plugins_dir.is_dir() {
         for entry in fs::read_dir(&plugins_dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.is_dir() {
-                // 加入 plugins/foo/config 和 plugins/foo/data（如果存在）
-                add_path(&mut tar, &cwd, &path.join("config"))?;
-                add_path(&mut tar, &cwd, &path.join("data"))?;
+                // 收集 plugins/foo/config 和 plugins/foo/data（如果存在）
+                collect_dir_all(&path.join("config"), &mut files_to_add, &mut rel_seen, cwd)?;
+                collect_dir_all(&path.join("data"), &mut files_to_add, &mut rel_seen, cwd)?;
 
                 // detect git repo inside this plugin folder
-                // 如果 path/.git 存在，则尝试打开
                 let git_path = path.join(".git");
                 if git_path.exists() {
                     if let Ok(repo) = Repository::open(&path) {
-                        // remote: try origin first然后其它
                         let mut remote_url = String::new();
                         if let Ok(remote) = repo.find_remote("origin") {
                             if let Some(url) = remote.url() {
@@ -148,13 +216,14 @@ fn backup(out: PathBuf) -> Result<()> {
                             }
                         }
 
-                        let commit = repo.head().ok().and_then(|h| h.target()).map(|oid| oid.to_string());
+                        let commit = repo
+                            .head()
+                            .ok()
+                            .and_then(|h| h.target())
+                            .map(|oid| oid.to_string());
 
                         repos_info.push(GitRepoInfo {
-                            path: path
-                                .strip_prefix(&cwd)?
-                                .to_string_lossy()
-                                .replace('\\', "/"),
+                            path: path.strip_prefix(cwd)?.to_string_lossy().replace('\\', "/"),
                             remote: remote_url,
                             branch,
                             commit,
@@ -162,27 +231,41 @@ fn backup(out: PathBuf) -> Result<()> {
                     }
                 }
 
-                // --- 新增: 专门处理 plugins/example 下的 .js/.js.bak 文件和 package.json（跳过 node_modules） ---
+                // 专门处理 plugins/example 的收集策略
                 if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
                     if name == "example" {
-                        for e in WalkDir::new(&path) {
-                            let e = e?;
-                            let p = e.path();
-
-                            // 跳过 node_modules 内的任何文件/目录
-                            let has_node_modules = p.components().any(|c| c.as_os_str() == OsStr::new("node_modules"));
-                            if has_node_modules {
-                                continue;
-                            }
-
-                            if p.is_file() {
-                                let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                                // 包含 .js 或 .js.bak 后缀，或是 package.json
-                                if fname.ends_with(".js") || fname.ends_with(".js.bak") || fname == "package.json" {
-                                    let name_in_tar = p.strip_prefix(&cwd)?;
-                                    tar.append_path_with_name(p, name_in_tar)?;
+                        if example_js_only {
+                            // 仅收集 .js / .js.bak / package.json（跳过 node_modules）
+                            if path.exists() {
+                                for e in WalkDir::new(&path) {
+                                    let e = e?;
+                                    let p = e.path();
+                                    let skip = p
+                                        .components()
+                                        .any(|c| c.as_os_str() == OsStr::new("node_modules"));
+                                    if skip {
+                                        continue;
+                                    }
+                                    if p.is_file() {
+                                        let fname =
+                                            p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                                        if fname.ends_with(".js")
+                                            || fname.ends_with(".js.bak")
+                                            || fname == "package.json"
+                                        {
+                                            push_file(p, &mut files_to_add, &mut rel_seen, cwd)?;
+                                        }
+                                    }
                                 }
                             }
+                        } else {
+                            // 收集 example 下的全部文件（但跳过 node_modules）
+                            collect_dir_skip_node_modules(
+                                &path,
+                                &mut files_to_add,
+                                &mut rel_seen,
+                                cwd,
+                            )?;
                         }
                     }
                 }
@@ -190,7 +273,26 @@ fn backup(out: PathBuf) -> Result<()> {
         }
     }
 
-    // 写 metadata.json 到一个临时文件，再加入到 tar
+    // 如果既没有要打包的文件，也没有检测到任何 git 仓库，则认为运行目录不符合预期，异常退出且不生成压缩包
+    if files_to_add.is_empty() && repos_info.is_empty() {
+        bail!(
+            "工作目录 '{}' 下未发现可备份的文件或仓库，已取消备份",
+            cwd.display()
+        );
+    }
+
+    // 创建 tar.gz 并把收集到的文件写入
+    let tar_gz =
+        fs::File::create(&out).with_context(|| format!("无法创建输出文件 {}", out.display()))?;
+    let enc = GzEncoder::new(tar_gz, Compression::default());
+    let mut tar = Builder::new(enc);
+
+    for p in &files_to_add {
+        let name_in_tar = p.strip_prefix(cwd)?;
+        tar.append_path_with_name(p, name_in_tar)?;
+    }
+
+    // 写 metadata.json 到 tar（即使 repos_info 为空，也写入）
     let meta = MetaData {
         repos: repos_info,
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -209,31 +311,37 @@ fn backup(out: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn restore(input: PathBuf) -> Result<()> {
-    let cwd = std::env::current_dir()?;
+fn restore(cwd: &Path, input: PathBuf) -> Result<()> {
     println!("工作目录: {}", cwd.display());
 
     // 解压到临时目录
     let tmp = TempDir::new()?;
     let tmp_path = tmp.path();
 
-    let tar_gz = fs::File::open(&input).with_context(|| format!("无法打开备份文件 {}", input.display()))?;
+    let tar_gz =
+        fs::File::open(&input).with_context(|| format!("无法打开备份文件 {}", input.display()))?;
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(tar_gz));
     archive.unpack(&tmp_path)?;
 
-    // 读取 metadata.json
+    // 读取 metadata.json（如果有）
     let meta_file = tmp_path.join("metadata.json");
     let meta: MetaData = if meta_file.exists() {
         let mut s = String::new();
         fs::File::open(&meta_file)?.read_to_string(&mut s)?;
         serde_json::from_str(&s)?
     } else {
-        MetaData { repos: vec![], created_at: "".into() }
+        MetaData {
+            repos: vec![],
+            created_at: "".into(),
+        }
     };
 
     // 1) 按 metadata 先 clone 仓库
     for repo in &meta.repos {
-        println!("处理 repo: {} -> {} (branch={})", repo.path, repo.remote, repo.branch);
+        println!(
+            "处理 repo: {} -> {} (branch={})",
+            repo.path, repo.remote, repo.branch
+        );
         if repo.remote.is_empty() {
             println!("  warning: repo {} 没有记录 remote，跳过 clone", repo.path);
             continue;
@@ -243,18 +351,19 @@ fn restore(input: PathBuf) -> Result<()> {
             println!("  目标已存在，先删除：{}", target.display());
             fs::remove_dir_all(&target)?;
         }
-        // clone with specified branch
         let mut cb = git2::build::RepoBuilder::new();
-        // try to set branch; RepoBuilder::branch expects a branch name
-        let rb = if !repo.branch.is_empty() { cb.branch(&repo.branch) } else { &mut cb };
+        let rb = if !repo.branch.is_empty() {
+            cb.branch(&repo.branch)
+        } else {
+            &mut cb
+        };
         match rb.clone(&repo.remote, &target) {
             Ok(_) => println!("  clone 完成"),
             Err(e) => println!("  clone 失败: {}", e),
         }
     }
 
-    // 2) 把 tmp 中的 config data dump.rdb 覆盖回 cwd
-    // helper copy
+    // helper: 目录复制（递归）
     fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
         if !src.exists() {
             return Ok(());
@@ -284,7 +393,7 @@ fn restore(input: PathBuf) -> Result<()> {
     let tmp_data = tmp_path.join("data");
     copy_dir_all(&tmp_data, &cwd.join("data"))?;
 
-    // plugins/**/config 和 data，以及单独还原 plugins/example 下的 .js/.js.bak 与 package.json
+    // plugins/**/config 和 data，以及恢复 example（归档里有什么就恢复什么）
     let tmp_plugins = tmp_path.join("plugins");
     if tmp_plugins.exists() {
         for entry in fs::read_dir(&tmp_plugins)? {
@@ -297,32 +406,29 @@ fn restore(input: PathBuf) -> Result<()> {
                 copy_dir_all(&plugin_path.join("config"), &dst_plugin.join("config"))?;
                 copy_dir_all(&plugin_path.join("data"), &dst_plugin.join("data"))?;
 
-                // 如果是 example 插件，单独遍历并还原 .js/.js.bak 与 package.json（跳过 node_modules）
+                // 对 example 插件：把归档中实际包含的文件恢复（无论是完整备份还是仅 js）
                 if let Some(name) = plugin_path.file_name().and_then(|s| s.to_str()) {
                     if name == "example" {
-                        // 确保目标目录存在
                         fs::create_dir_all(&dst_plugin)?;
                         for e in WalkDir::new(&plugin_path) {
                             let e = e?;
                             let p = e.path();
 
-                            // 跳过 node_modules 内的任何文件/目录
-                            let has_node_modules = p.components().any(|c| c.as_os_str() == OsStr::new("node_modules"));
+                            // 跳过 node_modules（备份时已跳过）
+                            let has_node_modules = p
+                                .components()
+                                .any(|c| c.as_os_str() == OsStr::new("node_modules"));
                             if has_node_modules {
                                 continue;
                             }
 
                             if p.is_file() {
-                                let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                                if fname.ends_with(".js") || fname.ends_with(".js.bak") || fname == "package.json" {
-                                    let relp = p.strip_prefix(&plugin_path)?;
-                                    let dest = dst_plugin.join(relp);
-                                    if let Some(parent) = dest.parent() {
-                                        fs::create_dir_all(parent)?;
-                                    }
-                                    // 直接覆盖写入（package.json 也会覆盖）
-                                    fs::copy(p, &dest)?;
+                                let relp = p.strip_prefix(&plugin_path)?;
+                                let dest = dst_plugin.join(relp);
+                                if let Some(parent) = dest.parent() {
+                                    fs::create_dir_all(parent)?;
                                 }
+                                fs::copy(p, &dest)?;
                             }
                         }
                     }
