@@ -4,6 +4,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use git2::Repository;
 use serde::{Deserialize, Serialize};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -78,34 +79,34 @@ fn backup(out: PathBuf) -> Result<()> {
     let mut tar = Builder::new(enc);
 
     // helper: 尝试把某个路径（文件或目录）添加到 tar
-    let mut add_path = |p: &Path| -> Result<()> {
+    fn add_path(tar: &mut Builder<GzEncoder<fs::File>>, cwd: &Path, p: &Path) -> Result<()> {
         if p.exists() {
             if p.is_file() {
-                tar.append_path_with_name(p, p.strip_prefix(&cwd)?.to_path_buf())?;
+                tar.append_path_with_name(p, p.strip_prefix(cwd)?.to_path_buf())?;
             } else if p.is_dir() {
                 // walkdir 把目录下所有文件加进去
                 for entry in WalkDir::new(p) {
                     let entry = entry?;
                     let path = entry.path();
                     if path.is_file() {
-                        let name = path.strip_prefix(&cwd)?;
+                        let name = path.strip_prefix(cwd)?;
                         tar.append_path_with_name(path, name)?;
                     }
                 }
             }
         }
         Ok(())
-    };
-
+    }
+    
     // 1) dump.rdb
     let dump = cwd.join("dump.rdb");
-    add_path(&dump)?;
-
+    add_path(&mut tar, &cwd, &dump)?;
+    
     // 2) ./config 和 ./data
-    add_path(&cwd.join("config"))?;
-    add_path(&cwd.join("data"))?;
+    add_path(&mut tar, &cwd, &cwd.join("config"))?;
+    add_path(&mut tar, &cwd, &cwd.join("data"))?;
 
-    // 3) plugins/**/(config|data) 和扫描 git 仓库
+    // 3) plugins/**/(config|data) 和扫描 git 仓库，并且额外处理 plugins/example 的 .js/.js.bak 与 package.json
     let plugins_dir = cwd.join("plugins");
     if plugins_dir.exists() && plugins_dir.is_dir() {
         for entry in fs::read_dir(&plugins_dir)? {
@@ -113,15 +114,15 @@ fn backup(out: PathBuf) -> Result<()> {
             let path = entry.path();
             if path.is_dir() {
                 // 加入 plugins/foo/config 和 plugins/foo/data（如果存在）
-                add_path(&path.join("config"))?;
-                add_path(&path.join("data"))?;
+                add_path(&mut tar, &cwd, &path.join("config"))?;
+                add_path(&mut tar, &cwd, &path.join("data"))?;
 
                 // detect git repo inside this plugin folder
                 // 如果 path/.git 存在，则尝试打开
                 let git_path = path.join(".git");
                 if git_path.exists() {
                     if let Ok(repo) = Repository::open(&path) {
-                        // remote: try origin first then any
+                        // remote: try origin first然后其它
                         let mut remote_url = String::new();
                         if let Ok(remote) = repo.find_remote("origin") {
                             if let Some(url) = remote.url() {
@@ -129,12 +130,10 @@ fn backup(out: PathBuf) -> Result<()> {
                             }
                         }
                         if remote_url.is_empty() {
-                            // pick first remote
                             if let Ok(remotes) = repo.remotes() {
                                 if let Some(name) = remotes.get(0) {
                                     if let Ok(r) = repo.find_remote(name) {
                                         if let Some(url) = r.url() {
-                                            // 立刻变成拥有所有权的 String
                                             remote_url = url.to_string();
                                         }
                                     }
@@ -160,6 +159,31 @@ fn backup(out: PathBuf) -> Result<()> {
                             branch,
                             commit,
                         });
+                    }
+                }
+
+                // --- 新增: 专门处理 plugins/example 下的 .js/.js.bak 文件和 package.json（跳过 node_modules） ---
+                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                    if name == "example" {
+                        for e in WalkDir::new(&path) {
+                            let e = e?;
+                            let p = e.path();
+
+                            // 跳过 node_modules 内的任何文件/目录
+                            let has_node_modules = p.components().any(|c| c.as_os_str() == OsStr::new("node_modules"));
+                            if has_node_modules {
+                                continue;
+                            }
+
+                            if p.is_file() {
+                                let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                                // 包含 .js 或 .js.bak 后缀，或是 package.json
+                                if fname.ends_with(".js") || fname.ends_with(".js.bak") || fname == "package.json" {
+                                    let name_in_tar = p.strip_prefix(&cwd)?;
+                                    tar.append_path_with_name(p, name_in_tar)?;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -260,7 +284,7 @@ fn restore(input: PathBuf) -> Result<()> {
     let tmp_data = tmp_path.join("data");
     copy_dir_all(&tmp_data, &cwd.join("data"))?;
 
-    // plugins/**/config 和 data
+    // plugins/**/config 和 data，以及单独还原 plugins/example 下的 .js/.js.bak 与 package.json
     let tmp_plugins = tmp_path.join("plugins");
     if tmp_plugins.exists() {
         for entry in fs::read_dir(&tmp_plugins)? {
@@ -269,8 +293,40 @@ fn restore(input: PathBuf) -> Result<()> {
             if plugin_path.is_dir() {
                 let rel = plugin_path.strip_prefix(&tmp_plugins)?;
                 let dst_plugin = cwd.join("plugins").join(rel);
+                // 先还原 config 与 data（如果存在）
                 copy_dir_all(&plugin_path.join("config"), &dst_plugin.join("config"))?;
                 copy_dir_all(&plugin_path.join("data"), &dst_plugin.join("data"))?;
+
+                // 如果是 example 插件，单独遍历并还原 .js/.js.bak 与 package.json（跳过 node_modules）
+                if let Some(name) = plugin_path.file_name().and_then(|s| s.to_str()) {
+                    if name == "example" {
+                        // 确保目标目录存在
+                        fs::create_dir_all(&dst_plugin)?;
+                        for e in WalkDir::new(&plugin_path) {
+                            let e = e?;
+                            let p = e.path();
+
+                            // 跳过 node_modules 内的任何文件/目录
+                            let has_node_modules = p.components().any(|c| c.as_os_str() == OsStr::new("node_modules"));
+                            if has_node_modules {
+                                continue;
+                            }
+
+                            if p.is_file() {
+                                let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                                if fname.ends_with(".js") || fname.ends_with(".js.bak") || fname == "package.json" {
+                                    let relp = p.strip_prefix(&plugin_path)?;
+                                    let dest = dst_plugin.join(relp);
+                                    if let Some(parent) = dest.parent() {
+                                        fs::create_dir_all(parent)?;
+                                    }
+                                    // 直接覆盖写入（package.json 也会覆盖）
+                                    fs::copy(p, &dest)?;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
